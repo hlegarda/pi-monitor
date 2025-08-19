@@ -1,7 +1,7 @@
-version: "3.9"
 services:
   pi-monitor:
-    build: .
+    image: hlegarda/pi-monitor:latest
+    container_name: pi-monitor
+    restart: unless-stopped
     ports:
       - "5100:5100"
-    restart: unless-stopped
