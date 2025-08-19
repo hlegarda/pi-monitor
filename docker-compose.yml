@@ -1,0 +1,7 @@
+version: "3.9"
+services:
+  pi-monitor:
+    build: .
+    ports:
+      - "5100:5100"
+    restart: unless-stopped
