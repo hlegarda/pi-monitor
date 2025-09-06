@@ -2,6 +2,7 @@ from flask import Flask, render_template_string, jsonify
 import psutil
 import subprocess
 import time
+import os
 
 app = Flask(__name__)
 
@@ -12,7 +13,7 @@ HTML = """
 <!doctype html>
 <html>
 <head>
-    <title>Raspberry Pi 5 Monitor</title>
+    <title>Hanzel's Cloud Monitor</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         body {
@@ -82,7 +83,7 @@ HTML = """
     </style>
 </head>
 <body>
-    <h1>Raspberry Pi 5 Monitor</h1>
+    <h1>Hanzel's Cloud Monitor</h1>
     <div id="statusIndicator" class="status-green">🟢 Healthy</div>
 
     <div class="summary-bar">
@@ -110,6 +111,10 @@ HTML = """
             <div class="summary-title">Net Download</div>
             <div class="summary-value" id="netDownSummary">-- KB/s</div>
         </div>
+        <div class="summary-card">
+            <div class="summary-title">USB / Secondary</div>
+            <div class="summary-value" id="secondaryDisksSummary">--%</div>
+        </div>
     </div>
 
     <div class="charts-grid">
@@ -118,11 +123,13 @@ HTML = """
         <div class="chart-card"><canvas id="memChart"></canvas></div>
         <div class="chart-card"><canvas id="diskChart"></canvas></div>
         <div class="chart-card"><canvas id="netChart"></canvas></div>
+        <div class="chart-card"><canvas id="secondaryDiskChart"></canvas></div>
     </div>
 
     <script>
         const labels = [];
         const cpuData = [], tempData = [], memData = [], diskData = [], netUpData = [], netDownData = [];
+        const secondaryDiskData = {};
 
         function createChart(ctx, datasets) {
             return new Chart(ctx, {
@@ -156,6 +163,8 @@ HTML = """
             { label: "Upload (KB/s)", data: netUpData, borderColor: 'red', backgroundColor: 'rgba(255,0,0,0.2)', fill: true, tension: 0.3 },
             { label: "Download (KB/s)", data: netDownData, borderColor: 'blue', backgroundColor: 'rgba(0,0,255,0.2)', fill: true, tension: 0.3 }
         ]);
+        const secondaryDiskChartCtx = document.getElementById("secondaryDiskChart");
+        let secondaryDiskChart = null;
 
         function setColor(element, value, type) {
             let color = "#4cafef"; // default
@@ -163,17 +172,73 @@ HTML = """
                 if (value <= 60) color = "lime";
                 else if (value <= 85) color = "orange";
                 else color = "red";
-            }
-            else if (type === "temp") {
+            } else if (type === "temp") {
                 if (value <= 60) color = "lime";
                 else if (value <= 75) color = "orange";
                 else color = "red";
-            }
-            else if (type === "net") {
+            } else if (type === "net") {
                 color = "deepskyblue";
             }
             element.style.color = color;
             return color;
+        }
+
+        function updateSecondaryDisks(disks) {
+            const secondaryDisksEl = document.getElementById("secondaryDisksSummary");
+            if (disks.length === 0) {
+                secondaryDisksEl.innerText = "N/A";
+                secondaryDisksEl.style.color = "#4cafef";
+                return;
+            }
+            let display = disks.map(d => `${d.mount}: ${d.percent}%`).join(" | ");
+            secondaryDisksEl.innerText = display;
+
+            let maxUsage = Math.max(...disks.map(d => d.percent));
+            if (maxUsage <= 60) secondaryDisksEl.style.color = "lime";
+            else if (maxUsage <= 85) secondaryDisksEl.style.color = "orange";
+            else secondaryDisksEl.style.color = "red";
+
+            const timeLabel = new Date().toLocaleTimeString();
+
+            // initialize chart
+            if (!secondaryDiskChart) {
+                disks.forEach(d => secondaryDiskData[d.mount] = []);
+                const datasets = disks.map((d, i) => ({
+                    label: d.mount,
+                    data: secondaryDiskData[d.mount],
+                    borderColor: `hsl(${i*60},70%,50%)`,
+                    backgroundColor: `hsla(${i*60},70%,50%,0.2)`,
+                    fill: true,
+                    tension: 0.3
+                }));
+                secondaryDiskChart = new Chart(secondaryDiskChartCtx, {
+                    type: 'line',
+                    data: { labels: [], datasets: datasets },
+                    options: {
+                        responsive: true,
+                        animation: false,
+                        plugins: { legend: { labels: { color: '#eee' } } },
+                        scales: {
+                            x: { ticks: { color: '#bbb' }, grid: { color: '#444' } },
+                            y: { beginAtZero: true, ticks: { color: '#bbb' }, grid: { color: '#444' } }
+                        }
+                    }
+                });
+            }
+
+            if (secondaryDiskChart.data.labels.length > 30) {
+                secondaryDiskChart.data.labels.shift();
+                Object.values(secondaryDiskData).forEach(arr => arr.shift());
+            }
+            secondaryDiskChart.data.labels.push(timeLabel);
+
+            disks.forEach((d, i) => {
+                if (!(d.mount in secondaryDiskData)) secondaryDiskData[d.mount] = [];
+                secondaryDiskData[d.mount].push(d.percent);
+                secondaryDiskChart.data.datasets[i].data = secondaryDiskData[d.mount];
+            });
+
+            secondaryDiskChart.update();
         }
 
         async function fetchData() {
@@ -220,6 +285,9 @@ HTML = """
             netUpEl.innerText = data.net_upload + " KB/s";
             netDownEl.innerText = data.net_download + " KB/s";
 
+            // --- Update secondary disks ---
+            updateSecondaryDisks(data.secondary_disks);
+
             // --- Update status indicator ---
             const statusEl = document.getElementById("statusIndicator");
             if (colors.includes("red")) {
@@ -250,6 +318,23 @@ def get_temperature():
             return temps["cpu_thermal"][0].current
         return None
 
+def get_secondary_disks():
+    """Return usage stats for all mounted drives under /mnt."""
+    disks = []
+    if os.path.exists("/mnt"):
+        for entry in os.scandir("/mnt"):
+            if entry.is_dir(follow_symlinks=False):
+                mountpoint = entry.path
+                try:
+                    usage = psutil.disk_usage(mountpoint)
+                    disks.append({
+                        "mount": mountpoint,
+                        "percent": usage.percent
+                    })
+                except PermissionError:
+                    continue  # skip if inaccessible
+    return disks
+
 @app.route("/")
 def index():
     return render_template_string(HTML)
@@ -272,6 +357,8 @@ def stats():
     last_net = current_net
     last_time = current_time
 
+    secondary_disks = get_secondary_disks()
+
     return jsonify(
         cpu_usage=round(cpu_usage, 1),
         temperature=round(temp, 1),
@@ -279,6 +366,7 @@ def stats():
         disk_percent=disk.percent,
         net_upload=round(upload_speed, 1),
         net_download=round(download_speed, 1),
+        secondary_disks=secondary_disks,
         timestamp=time.time()
     )
 

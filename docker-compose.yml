@@ -5,3 +5,5 @@ services:
     restart: unless-stopped
     ports:
       - "5100:5100"
+    volumes:
+      - /mnt/media:/mnt/media
